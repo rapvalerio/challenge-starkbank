@@ -1,0 +1,108 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Stark Bank Webhook Infrastructure
+  API Gateway -> SQS integration for resilient webhook processing
+
+Resources:
+  # 1. Main Queue for Webhooks
+  WebhookQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: starkbank-webhooks
+      VisibilityTimeout: 300 # 5 minutes to process
+      MessageRetentionPeriod: 345600 # 4 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WebhookDLQ.Arn
+        maxReceiveCount: 3
+
+  # 2. Dead Letter Queue for failed messages
+  WebhookDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: starkbank-webhooks-dlq
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  # 3. HTTP API Gateway (v2)
+  WebhookApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: StarkBankWebhookApi
+      ProtocolType: HTTP
+
+  # 4. IAM Role for API Gateway to send messages to SQS
+  ApiGatewaySqsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SendToSqs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt WebhookQueue.Arn
+
+  # 5. API Gateway Integration (Direct SQS)
+  WebhookIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebhookApi
+      IntegrationType: AWS_PROXY
+      IntegrationSubtype: SQS-SendMessage
+      CredentialsArn: !GetAtt ApiGatewaySqsRole.Arn
+      RequestParameters:
+        QueueUrl: !Ref WebhookQueue
+        MessageBody: $request.body
+        MessageAttributes: >-
+          {"digital-signature": {"DataType": "String", "StringValue": "${request.header.digital-signature}"}}
+      PayloadFormatVersion: '1.0'
+
+  # 6. Route for POST /webhook
+  WebhookRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebhookApi
+      RouteKey: POST /webhook
+      Target: !Join ['/', ['integrations', !Ref WebhookIntegration]]
+
+  # 7. IAM User for the Application (NestJS Consumer)
+  # This user will have permission to consume messages from the queue
+  AppSqsUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: starkbank-app-consumer
+
+  AppSqsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: AppConsumerPolicy
+      Users:
+        - !Ref AppSqsUser
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+            Resource: !GetAtt WebhookQueue.Arn
+
+Outputs:
+  WebhookApiUrl:
+    Description: 'URL for Stark Bank Webhook'
+    Value: !GetAtt WebhookApi.ApiEndpoint
+  QueueUrl:
+    Description: 'URL of the SQS Queue'
+    Value: !Ref WebhookQueue
+  AppUserArn:
+    Description: 'ARN of the IAM User for the App'
+    Value: !GetAtt AppSqsUser.Arn
